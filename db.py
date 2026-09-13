@@ -155,6 +155,10 @@ def init_db():
 
     if "last_finance_at" not in user_columns:
         cursor.execute("ALTER TABLE users ADD COLUMN last_finance_at REAL")
+    if "credit_score" not in user_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN credit_score INTEGER DEFAULT 650")
+    if "history_cleared_at" not in user_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN history_cleared_at TIMESTAMP")
 
     cursor.execute("PRAGMA table_info(credits)")
     credit_columns = [row[1] for row in cursor.fetchall()]
@@ -162,6 +166,8 @@ def init_db():
         cursor.execute("ALTER TABLE credits ADD COLUMN overdue_since REAL")
     if "payment_type" not in credit_columns:
         cursor.execute("ALTER TABLE credits ADD COLUMN payment_type TEXT DEFAULT 'annuity'")
+    if "business_id" not in credit_columns:
+        cursor.execute("ALTER TABLE credits ADD COLUMN business_id INTEGER")
 
     cursor.execute("PRAGMA table_info(deposits)")
     deposit_columns = [row[1] for row in cursor.fetchall()]
@@ -177,8 +183,25 @@ def init_db():
         cursor.execute("ALTER TABLE transactions ADD COLUMN recipient_name TEXT")
     if "tax_amount" not in tx_columns:
         cursor.execute("ALTER TABLE transactions ADD COLUMN tax_amount REAL DEFAULT 0.0")
+    if "commission_amount" not in tx_columns:
+        cursor.execute("ALTER TABLE transactions ADD COLUMN commission_amount REAL DEFAULT 0.0")
+    if "is_tax_payment" not in tx_columns:
+        cursor.execute("ALTER TABLE transactions ADD COLUMN is_tax_payment INTEGER DEFAULT 0")
     if "business_id" not in tx_columns:
         cursor.execute("ALTER TABLE transactions ADD COLUMN business_id INTEGER")
+        
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS credit_history_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        event_type TEXT NOT NULL,
+        score_delta INTEGER NOT NULL,
+        new_score INTEGER NOT NULL,
+        description TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id)
+    )
+    """)
         
     cursor.execute("PRAGMA table_info(nfc_tokens)")
     nfc_columns = [row[1] for row in cursor.fetchall()]
@@ -253,7 +276,8 @@ def create_user(email: str, password: str, full_name: Optional[str] = None, phon
     
     cursor.execute("""
     SELECT id, email, card_number, account_number, phone_number, balance, full_name, is_frozen, is_admin, avatar_url, created_at,
-           is_pin_enabled, CASE WHEN pin_code IS NOT NULL AND pin_code != '' THEN 1 ELSE 0 END as has_pin
+           is_pin_enabled, CASE WHEN pin_code IS NOT NULL AND pin_code != '' THEN 1 ELSE 0 END as has_pin,
+           COALESCE(credit_score, 650) as credit_score, history_cleared_at
     FROM users WHERE id = ?
     """, (user_id,))
     user = dict(cursor.fetchone())
@@ -273,7 +297,8 @@ def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
     cursor = conn.cursor()
     cursor.execute("""
     SELECT id, email, card_number, account_number, phone_number, balance, full_name, is_frozen, is_admin, avatar_url, created_at,
-           is_pin_enabled, CASE WHEN pin_code IS NOT NULL AND pin_code != '' THEN 1 ELSE 0 END as has_pin
+           is_pin_enabled, CASE WHEN pin_code IS NOT NULL AND pin_code != '' THEN 1 ELSE 0 END as has_pin,
+           COALESCE(credit_score, 650) as credit_score, history_cleared_at
     FROM users WHERE id = ?
     """, (user_id,))
     row = cursor.fetchone()
@@ -291,7 +316,8 @@ def find_user_by_target(target: str) -> Optional[Dict[str, Any]]:
     
     user_select = """
     SELECT id, email, card_number, account_number, phone_number, balance, full_name, is_frozen, is_admin, avatar_url, created_at,
-           is_pin_enabled, CASE WHEN pin_code IS NOT NULL AND pin_code != '' THEN 1 ELSE 0 END as has_pin
+           is_pin_enabled, CASE WHEN pin_code IS NOT NULL AND pin_code != '' THEN 1 ELSE 0 END as has_pin,
+           COALESCE(credit_score, 650) as credit_score, history_cleared_at
     FROM users
     """
     
@@ -348,7 +374,8 @@ def get_all_users() -> List[Dict[str, Any]]:
     cursor = conn.cursor()
     cursor.execute("""
     SELECT id, email, card_number, account_number, phone_number, balance, full_name, is_frozen, is_admin, avatar_url, created_at,
-           is_pin_enabled, CASE WHEN pin_code IS NOT NULL AND pin_code != '' THEN 1 ELSE 0 END as has_pin
+           is_pin_enabled, CASE WHEN pin_code IS NOT NULL AND pin_code != '' THEN 1 ELSE 0 END as has_pin,
+           COALESCE(credit_score, 650) as credit_score, history_cleared_at
     FROM users
     ORDER BY is_admin DESC, id ASC
     """)
@@ -519,6 +546,22 @@ def transfer_funds(
         conn.close()
         raise ValueError("Ваш счёт заморожен банком. Расходные операции приостановлены.")
         
+    commission_rate = 0.0
+    if tx_type == "qr":
+        commission_rate = 1.0
+    elif tx_type == "nfc":
+        if amount <= 1000.0:
+            commission_rate = 0.0
+        elif amount <= 10000.0:
+            commission_rate = 1.0
+        elif amount <= 50000.0:
+            commission_rate = 2.0
+        else:
+            commission_rate = 3.0
+
+    commission_amount = round(amount * (commission_rate / 100.0), 2) if commission_rate > 0 else 0.0
+    total_sender_charge = round(amount + commission_amount, 2)
+
     sender_biz = None
     deducted_from_biz = False
     if business_id:
@@ -532,15 +575,15 @@ def transfer_funds(
             conn.close()
             raise ValueError(f"Бизнес-счёт «{sender_biz['company_name']}» {sender_biz['status']}. Переводы не разрешены.")
         is_salary = True
-        if sender_biz["balance"] >= amount:
+        if sender_biz["balance"] >= total_sender_charge:
             deducted_from_biz = True
-        elif sender["balance"] < amount:
+        elif sender["balance"] < total_sender_charge:
             conn.close()
-            raise ValueError(f"Недостаточно средств на бизнес-счёте ({sender_biz['balance']:.2f} ₽) и на карте ({sender['balance']:.2f} ₽)")
+            raise ValueError(f"Недостаточно средств с учётом комиссии ({commission_amount:.2f} ₽). Доступно на бизнес-счёте: {sender_biz['balance']:.2f} ₽, на карте: {sender['balance']:.2f} ₽")
 
-    if not deducted_from_biz and sender["balance"] < amount:
+    if not deducted_from_biz and sender["balance"] < total_sender_charge:
         conn.close()
-        raise ValueError(f"Недостаточно средств. Доступно: {sender['balance']:.2f} ₽")
+        raise ValueError(f"Недостаточно средств для перевода и комиссии ({commission_amount:.2f} ₽). Всего требуется: {total_sender_charge:.2f} ₽, доступно: {sender['balance']:.2f} ₽")
         
     recipient = find_user_by_target(target)
     if not recipient:
@@ -581,15 +624,17 @@ def transfer_funds(
             )
         )
     )
+    if commission_amount > 0 and "комиссия" not in desc.lower():
+        desc += f" (Комиссия {commission_rate:.1f}%: {commission_amount:.2f} ₽)"
     if tax_amount > 0 and "налог" not in desc.lower() and "ндфл" not in desc.lower():
         desc += f" (Удержан НДФЛ {effective_tax_rate:.0f}%: {tax_amount:.2f} ₽)"
     
     try:
         if deducted_from_biz:
-            cursor.execute("UPDATE business_accounts SET balance = balance - ? WHERE id = ?", (amount, business_id))
+            cursor.execute("UPDATE business_accounts SET balance = balance - ? WHERE id = ?", (total_sender_charge, business_id))
             sender_new_balance = sender["balance"]
         else:
-            sender_new_balance = sender["balance"] - amount
+            sender_new_balance = sender["balance"] - total_sender_charge
             cursor.execute("UPDATE users SET balance = ? WHERE id = ?", (sender_new_balance, sender_id))
             
         if recipient_biz_id:
@@ -599,9 +644,9 @@ def transfer_funds(
         
         tx_biz_id = recipient_biz_id or business_id
         cursor.execute("""
-        INSERT INTO transactions (sender_id, recipient_id, sender_name, recipient_name, amount, type, status, description, tax_amount, business_id)
-        VALUES (?, ?, ?, ?, ?, ?, 'completed', ?, ?, ?)
-        """, (sender_id, recipient["id"], s_name, r_name, amount, tx_type, desc, tax_amount, tx_biz_id))
+        INSERT INTO transactions (sender_id, recipient_id, sender_name, recipient_name, amount, type, status, description, tax_amount, commission_amount, business_id)
+        VALUES (?, ?, ?, ?, ?, ?, 'completed', ?, ?, ?, ?)
+        """, (sender_id, recipient["id"], s_name, r_name, amount, tx_type, desc, tax_amount, commission_amount, tx_biz_id))
         
         tx_id = cursor.lastrowid
         conn.commit()
@@ -619,6 +664,8 @@ def transfer_funds(
         "sender_name": s_name,
         "recipient_name": r_name,
         "amount": amount,
+        "commission_amount": commission_amount,
+        "total_debited": total_sender_charge,
         "tax_amount": tax_amount,
         "recipient_received": recipient_credit,
         "sender_new_balance": sender_new_balance,
@@ -629,13 +676,23 @@ def transfer_funds(
 def get_user_transactions(user_id: int, limit: int = 50) -> List[Dict[str, Any]]:
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("""
-    SELECT id, sender_id, recipient_id, sender_name, recipient_name, amount, type, status, description, tax_amount, business_id, created_at
+    cursor.execute("SELECT history_cleared_at FROM users WHERE id = ?", (user_id,))
+    u = cursor.fetchone()
+    cleared_at = u["history_cleared_at"] if u else None
+
+    query = """
+    SELECT id, sender_id, recipient_id, sender_name, recipient_name, amount, type, status, description, tax_amount, commission_amount, business_id, created_at
     FROM transactions
-    WHERE sender_id = ? OR recipient_id = ?
-    ORDER BY created_at DESC, id DESC
-    LIMIT ?
-    """, (user_id, user_id, limit))
+    WHERE (sender_id = ? OR recipient_id = ?)
+    """
+    params: List[Any] = [user_id, user_id]
+    if cleared_at:
+        query += " AND created_at > ?"
+        params.append(cleared_at)
+    query += " ORDER BY created_at DESC, id DESC LIMIT ?"
+    params.append(limit)
+
+    cursor.execute(query, params)
     rows = cursor.fetchall()
     conn.close()
     
@@ -643,6 +700,40 @@ def get_user_transactions(user_id: int, limit: int = 50) -> List[Dict[str, Any]]
     for r in rows:
         d = dict(r)
         d["direction"] = "incoming" if d["recipient_id"] == user_id else "outgoing"
+        res.append(d)
+    return res
+
+def clear_user_history(user_id: int) -> bool:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET history_cleared_at = CURRENT_TIMESTAMP WHERE id = ?", (user_id,))
+    affected = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return affected > 0
+
+def admin_get_user_full_transactions(user_id: int, limit: int = 200) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT history_cleared_at FROM users WHERE id = ?", (user_id,))
+    u = cursor.fetchone()
+    cleared_at = u["history_cleared_at"] if u else None
+
+    cursor.execute("""
+    SELECT id, sender_id, recipient_id, sender_name, recipient_name, amount, type, status, description, tax_amount, commission_amount, business_id, created_at
+    FROM transactions
+    WHERE sender_id = ? OR recipient_id = ?
+    ORDER BY created_at DESC, id DESC
+    LIMIT ?
+    """, (user_id, user_id, limit))
+    rows = cursor.fetchall()
+    conn.close()
+
+    res = []
+    for r in rows:
+        d = dict(r)
+        d["direction"] = "incoming" if d["recipient_id"] == user_id else "outgoing"
+        d["hidden_by_user"] = bool(cleared_at and d.get("created_at") and d["created_at"] <= cleared_at)
         res.append(d)
     return res
 
@@ -1181,6 +1272,73 @@ def admin_create_business(user_id: int, company_name: str, business_type: str, t
     return row
 
 
+def adjust_user_credit_score_internal(cursor: sqlite3.Cursor, user_id: int, delta: int, description: str) -> int:
+    cursor.execute("SELECT credit_score FROM users WHERE id = ?", (user_id,))
+    row = cursor.fetchone()
+    current_score = row["credit_score"] if row and row["credit_score"] is not None else 650
+    new_score = max(300, min(850, current_score + delta))
+    cursor.execute("UPDATE users SET credit_score = ? WHERE id = ?", (new_score, user_id))
+    cursor.execute("""
+    INSERT INTO credit_history_events (user_id, event_type, score_delta, new_score, description)
+    VALUES (?, ?, ?, ?, ?)
+    """, (user_id, "score_adjustment" if delta != 0 else "info", delta, new_score, description))
+    return new_score
+
+def get_credit_score_category(score: int) -> Dict[str, Any]:
+    if score >= 750:
+        return {"category": "Отличная", "code": "excellent", "is_allowed": True, "color": "#15803D"}
+    elif score >= 650:
+        return {"category": "Хорошая", "code": "good", "is_allowed": True, "color": "#2563EB"}
+    elif score >= 500:
+        return {"category": "Средняя", "code": "fair", "is_allowed": True, "color": "#D97706"}
+    else:
+        return {"category": "Плохая", "code": "poor", "is_allowed": False, "color": "#DC2626"}
+
+def get_user_credit_history(user_id: int) -> Dict[str, Any]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT credit_score, full_name FROM users WHERE id = ?", (user_id,))
+    u = cursor.fetchone()
+    if not u:
+        conn.close()
+        raise ValueError("Пользователь не найден.")
+    score = u["credit_score"] if u["credit_score"] is not None else 650
+    cursor.execute("""
+    SELECT id, user_id, event_type, score_delta, new_score, description, created_at
+    FROM credit_history_events
+    WHERE user_id = ?
+    ORDER BY created_at DESC, id DESC
+    LIMIT 100
+    """, (user_id,))
+    events = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    cat = get_credit_score_category(score)
+    return {
+        "user_id": user_id,
+        "score": score,
+        "category": cat["category"],
+        "category_code": cat["code"],
+        "is_credit_allowed": cat["is_allowed"],
+        "color": cat["color"],
+        "events": events
+    }
+
+def admin_adjust_user_credit_score(admin_id: int, user_id: int, score_delta: int, description: str) -> Dict[str, Any]:
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        new_score = adjust_user_credit_score_internal(cursor, user_id, score_delta, f"Ручная корректировка: {description}")
+        conn.commit()
+        cat = get_credit_score_category(new_score)
+        return {"success": True, "new_score": new_score, "category": cat["category"]}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def apply_credit(
     user_id: int,
     title: str,
@@ -1188,6 +1346,7 @@ def apply_credit(
     interest_rate: float = 14.9,
     term_months: int = 12,
     payment_type: str = "annuity",
+    business_id: Optional[int] = None,
 ) -> dict:
     if amount <= 0:
         raise ValueError("Сумма кредита должна быть больше 0.")
@@ -1210,29 +1369,25 @@ def apply_credit(
         cursor = conn.cursor()
         cursor.execute("BEGIN IMMEDIATE")
         
-        cursor.execute("SELECT id, full_name, balance FROM users WHERE id = ?", (user_id,))
+        cursor.execute("SELECT id, full_name, balance, credit_score FROM users WHERE id = ?", (user_id,))
         user = cursor.fetchone()
         if not user:
             raise ValueError("Пользователь не найден.")
             
-        now = time.time()
+        score = user["credit_score"] if user["credit_score"] is not None else 650
+        if score < 500:
+            raise ValueError(f"Кредитование заблокировано: у вас плохая кредитная история (рейтинг: {score} из 850). Для разблокировки погасите задолженности.")
+            
         cursor.execute("""
-        INSERT INTO credits (user_id, title, amount, remaining_amount, monthly_payment, interest_rate, term_months, status, payment_type)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)
-        """, (user_id, title.strip() or "Кредит наличными", amount, amount, monthly, interest_rate, term_months, normalized_type))
+        INSERT INTO credits (user_id, title, amount, remaining_amount, monthly_payment, interest_rate, term_months, status, payment_type, business_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+        """, (user_id, title.strip() or ("Кредит для бизнеса" if business_id else "Кредит наличными"), amount, amount, monthly, interest_rate, term_months, normalized_type, business_id))
         c_id = cursor.lastrowid
         
-        cursor.execute(
-            "UPDATE users SET balance = balance + ?, last_finance_at = COALESCE(last_finance_at, ?) WHERE id = ?",
-            (amount, now, user_id),
-        )
-        
         cursor.execute("""
-        INSERT INTO transactions
-            (sender_id, recipient_id, sender_name, recipient_name, amount, type, status, description)
-        VALUES
-            (NULL, ?, 'Копи Банк', ?, ?, 'credit_disbursement', 'completed', ?)
-        """, (user_id, user["full_name"], amount, f"Выдача кредита: {title.strip() or 'Кредит наличными'}"))
+        INSERT INTO credit_history_events (user_id, event_type, score_delta, new_score, description)
+        VALUES (?, 'credit_applied', 0, ?, ?)
+        """, (user_id, score, f"Подана заявка на кредит «{title.strip() or 'Кредит'}» на {amount:.0f} ₽ (ожидает одобрения администратора)"))
         
         conn.commit()
         cursor.execute("SELECT * FROM credits WHERE id = ?", (c_id,))
@@ -1258,7 +1413,7 @@ def admin_get_all_credits() -> list:
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
-    SELECT c.*, u.full_name as owner_name, u.email as owner_email
+    SELECT c.*, u.full_name as owner_name, u.email as owner_email, u.credit_score as owner_credit_score
     FROM credits c
     JOIN users u ON c.user_id = u.id
     ORDER BY CASE c.status WHEN 'pending' THEN 0 ELSE 1 END, c.id DESC
@@ -1294,12 +1449,94 @@ def admin_update_credit(
 
 def admin_delete_credit(credit_id: int) -> bool:
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM credits WHERE id = ?", (credit_id,))
-    affected = cursor.rowcount
-    conn.commit()
-    conn.close()
-    return affected > 0
+    try:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("SELECT * FROM credits WHERE id = ?", (credit_id,))
+        credit = cursor.fetchone()
+        if not credit:
+            conn.close()
+            return False
+
+        user_id = int(credit["user_id"])
+        status = credit["status"]
+        remaining = float(credit["remaining_amount"])
+        biz_id = credit["business_id"] if "business_id" in credit.keys() else None
+
+        if status in ("active", "frozen"):
+            cursor.execute("SELECT balance, full_name FROM users WHERE id = ?", (user_id,))
+            user = cursor.fetchone()
+            user_name = user["full_name"] if user else "Клиент"
+            
+            if biz_id:
+                cursor.execute("UPDATE business_accounts SET balance = balance - ? WHERE id = ?", (remaining, biz_id))
+            else:
+                cursor.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (remaining, user_id))
+
+            cursor.execute("""
+            INSERT INTO transactions (sender_id, recipient_id, sender_name, recipient_name, amount, type, status, description, business_id)
+            VALUES (?, NULL, ?, 'Копи Банк', ?, 'credit_revoked', 'completed', ?, ?)
+            """, (user_id, user_name, remaining, f"Списание долга при аннулировании кредита: {credit['title']}", biz_id))
+
+        cursor.execute("DELETE FROM credits WHERE id = ?", (credit_id,))
+        affected = cursor.rowcount
+        conn.commit()
+        return affected > 0
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def repay_user_credit(user_id: int, credit_id: int, repay_amount: Optional[float] = None) -> Dict[str, Any]:
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("SELECT * FROM credits WHERE id = ? AND user_id = ?", (credit_id, user_id))
+        credit = cursor.fetchone()
+        if not credit:
+            raise ValueError("Кредит не найден.")
+        if credit["status"] not in ("active", "frozen"):
+            raise ValueError(f"Операция невозможна для кредита в статусе «{credit['status']}».")
+
+        remaining = float(credit["remaining_amount"])
+        actual_pay = round(repay_amount if repay_amount is not None and repay_amount > 0 else remaining, 2)
+        if actual_pay > remaining:
+            actual_pay = remaining
+
+        cursor.execute("SELECT balance, full_name FROM users WHERE id = ?", (user_id,))
+        user = cursor.fetchone()
+        if not user or user["balance"] < actual_pay:
+            raise ValueError(f"Недостаточно средств на основном счете. Доступно: {user['balance'] if user else 0:.2f} ₽, требуется: {actual_pay:.2f} ₽")
+
+        new_remaining = round(remaining - actual_pay, 2)
+        new_status = "paid" if new_remaining <= 0.01 else credit["status"]
+        if new_remaining <= 0.01:
+            new_remaining = 0.0
+
+        cursor.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (actual_pay, user_id))
+        cursor.execute("UPDATE credits SET remaining_amount = ?, status = ?, overdue_since = NULL WHERE id = ?", (new_remaining, new_status, credit_id))
+
+        cursor.execute("""
+        INSERT INTO transactions (sender_id, recipient_id, sender_name, recipient_name, amount, type, status, description)
+        VALUES (?, NULL, ?, 'Копи Банк', ?, 'credit_repayment', 'completed', ?)
+        """, (user_id, user["full_name"], actual_pay, f"Погашение кредита «{credit['title']}»{' (досрочно закрыт)' if new_status == 'paid' else ''}"))
+
+        if new_status == "paid":
+            adjust_user_credit_score_internal(cursor, user_id, 35, f"Полное погашение кредита «{credit['title']}» (+35 баллов)")
+        else:
+            adjust_user_credit_score_internal(cursor, user_id, 10, f"Частичное погашение кредита «{credit['title']}»")
+
+        conn.commit()
+        cursor.execute("SELECT * FROM credits WHERE id = ?", (credit_id,))
+        res = dict(cursor.fetchone())
+        return res
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def admin_create_credit(user_id: int, title: str, amount: float, interest_rate: float = 14.9, term_months: int = 12) -> Dict[str, Any]:
     title = title.strip() or "Кредит наличными"
@@ -1337,60 +1574,127 @@ def issue_pending_credit(credit_id: int, conn: Optional[sqlite3.Connection] = No
     if credit["status"] in ("rejected", "paid"):
         raise ValueError("Операция недоступна для кредита в текущем состоянии.")
 
-    cursor.execute(
-        "UPDATE users SET balance = balance + ? WHERE id = ?",
-        (float(credit["amount"]), int(credit["user_id"])),
-    )
+    now = time.time()
+    user_id = int(credit["user_id"])
+    biz_id = credit["business_id"] if "business_id" in credit.keys() else None
+    amt = float(credit["amount"])
+
     cursor.execute(
         "UPDATE credits SET status = 'active', overdue_since = NULL WHERE id = ?",
         (credit_id,),
     )
+    if biz_id:
+        cursor.execute(
+            "UPDATE business_accounts SET balance = balance + ? WHERE id = ?",
+            (amt, biz_id),
+        )
+    else:
+        cursor.execute(
+            "UPDATE users SET balance = balance + ?, last_finance_at = COALESCE(last_finance_at, ?) WHERE id = ?",
+            (amt, now, user_id),
+        )
+
     cursor.execute(
         """
         INSERT INTO transactions
-            (sender_id, recipient_id, sender_name, recipient_name, amount, type, status, description)
+            (sender_id, recipient_id, sender_name, recipient_name, amount, type, status, description, business_id)
         VALUES
             (NULL, ?, 'Копи Банк', (SELECT full_name FROM users WHERE id = ?), ?,
-             'credit_disbursement', 'completed', ?)
+             'credit_disbursement', 'completed', ?, ?)
         """,
         (
-            int(credit["user_id"]),
-            int(credit["user_id"]),
-            float(credit["amount"]),
+            user_id,
+            user_id,
+            amt,
             f"Выдача кредита: {credit['title']}",
+            biz_id,
         ),
     )
+
+    adjust_user_credit_score_internal(cursor, user_id, 15, f"Одобрение кредита «{credit['title']}» банком")
 
     cursor.execute("SELECT * FROM credits WHERE id = ?", (credit_id,))
     res = dict(cursor.fetchone())
     if own_connection:
+        conn.commit()
         conn.close()
     return res
-
 
 
 def apply_deposit(user_id: int, title: str, amount: float, interest_rate: float = 16.0, term_months: int = 6) -> Dict[str, Any]:
     if amount <= 0:
         raise ValueError("Сумма вклада должна быть больше 0.")
+    if term_months <= 0:
+        raise ValueError("Срок размещения средств должен быть не менее 1 месяца.")
 
     conn = get_connection()
     try:
-        row = open_deposit_transactional(
-            user_id,
-            title,
-            float(amount),
-            float(interest_rate),
-            int(term_months),
-            "КопиВклад",
-            conn,
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("SELECT balance, full_name, credit_score FROM users WHERE id = ?", (user_id,))
+        user = cursor.fetchone()
+        if not user:
+            raise ValueError("Пользователь не найден.")
+        if user["balance"] < amount:
+            raise ValueError(f"Недостаточно средств для открытия вклада на {amount:.2f} ₽. Доступно на счете: {user['balance']:.2f} ₽")
+
+        now = time.time()
+        cursor.execute(
+            """
+            INSERT INTO deposits
+                (user_id, title, amount, interest_rate, term_months, earned_amount, status, last_accrual_at)
+            VALUES (?, ?, ?, ?, ?, 0.0, 'pending', ?)
+            """,
+            (user_id, title.strip() or "КопиВклад", float(amount), float(interest_rate), int(term_months), now)
         )
+        deposit_id = int(cursor.lastrowid)
         conn.commit()
+        cursor.execute("SELECT * FROM deposits WHERE id = ?", (deposit_id,))
+        row = dict(cursor.fetchone())
+        return row
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
-    return row
+
+
+def close_user_deposit(user_id: int, deposit_id: int) -> Dict[str, Any]:
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("SELECT * FROM deposits WHERE id = ? AND user_id = ?", (deposit_id, user_id))
+        dep = cursor.fetchone()
+        if not dep:
+            raise ValueError("Вклад не найден.")
+        if dep["status"] != "active":
+            raise ValueError(f"Невозможно закрыть вклад в статусе «{dep['status']}».")
+
+        amount = float(dep["amount"])
+        earned = float(dep["earned_amount"])
+        total_refund = round(amount + earned, 2)
+
+        cursor.execute("UPDATE deposits SET status = 'closed' WHERE id = ?", (deposit_id,))
+        cursor.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (total_refund, user_id))
+        cursor.execute("SELECT full_name FROM users WHERE id = ?", (user_id,))
+        u = cursor.fetchone()
+        user_name = u["full_name"] if u else "Клиент"
+
+        cursor.execute("""
+        INSERT INTO transactions (sender_id, recipient_id, sender_name, recipient_name, amount, type, status, description)
+        VALUES (NULL, ?, 'Копи Банк', ?, ?, 'deposit_closed', 'completed', ?)
+        """, (user_id, user_name, total_refund, f"Досрочное закрытие вклада «{dep['title']}» (тело: {amount:.2f} ₽, доход: {earned:.2f} ₽)"))
+
+        conn.commit()
+        cursor.execute("SELECT * FROM deposits WHERE id = ?", (deposit_id,))
+        res = dict(cursor.fetchone())
+        return res
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def open_deposit_transactional(
@@ -1455,6 +1759,7 @@ def open_deposit_transactional(
     cursor.execute("SELECT * FROM deposits WHERE id = ?", (deposit_id,))
     row = dict(cursor.fetchone())
     if own_connection:
+        conn.commit()
         conn.close()
     return row
 
@@ -1476,7 +1781,7 @@ def fund_pending_deposit(deposit_id: int) -> Dict[str, Any]:
         cursor.execute("SELECT balance FROM users WHERE id = ?", (int(deposit["user_id"]),))
         user = cursor.fetchone()
         if not user or user["balance"] < deposit["amount"]:
-            raise ValueError("Недостаточно средств для открытия вклада.")
+            raise ValueError(f"Недостаточно средств у пользователя для открытия вклада. Доступно: {user['balance'] if user else 0:.2f} ₽")
 
         now = time.time()
         cursor.execute(
@@ -1524,7 +1829,7 @@ def admin_get_all_deposits() -> List[Dict[str, Any]]:
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
-    SELECT d.*, u.full_name as owner_name, u.email as owner_email
+    SELECT d.*, u.full_name as owner_name, u.email as owner_email, u.credit_score as owner_credit_score
     FROM deposits d
     JOIN users u ON d.user_id = u.id
     ORDER BY CASE d.status WHEN 'pending' THEN 0 ELSE 1 END, d.id DESC
@@ -1560,12 +1865,152 @@ def admin_update_deposit(
 
 def admin_delete_deposit(deposit_id: int) -> bool:
     conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("SELECT * FROM deposits WHERE id = ?", (deposit_id,))
+        dep = cursor.fetchone()
+        if not dep:
+            conn.close()
+            return False
+
+        user_id = int(dep["user_id"])
+        status = dep["status"]
+        amount = float(dep["amount"])
+        earned = float(dep["earned_amount"])
+        total_refund = round(amount + earned, 2)
+
+        if status in ("active", "frozen"):
+            cursor.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (total_refund, user_id))
+            cursor.execute("SELECT full_name FROM users WHERE id = ?", (user_id,))
+            u = cursor.fetchone()
+            user_name = u["full_name"] if u else "Клиент"
+            cursor.execute("""
+            INSERT INTO transactions (sender_id, recipient_id, sender_name, recipient_name, amount, type, status, description)
+            VALUES (NULL, ?, 'Копи Банк', ?, ?, 'deposit_refund', 'completed', ?)
+            """, (user_id, user_name, total_refund, f"Возврат вклада и дохода при удалении: {dep['title']}"))
+
+        cursor.execute("DELETE FROM deposits WHERE id = ?", (deposit_id,))
+        affected = cursor.rowcount
+        conn.commit()
+        return affected > 0
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def get_business_analytics(business_id: int) -> Dict[str, Any]:
+    conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM deposits WHERE id = ?", (deposit_id,))
-    affected = cursor.rowcount
-    conn.commit()
+    cursor.execute("SELECT * FROM business_accounts WHERE id = ?", (business_id,))
+    biz = cursor.fetchone()
+    if not biz:
+        conn.close()
+        raise ValueError("Бизнес-аккаунт не найден.")
+    
+    cursor.execute("""
+    SELECT COALESCE(SUM(amount), 0.0) as income
+    FROM transactions
+    WHERE business_id = ? AND recipient_id = ?
+    """, (business_id, biz["user_id"]))
+    income = float(cursor.fetchone()["income"])
+
+    cursor.execute("""
+    SELECT COALESCE(SUM(amount), 0.0) as expenses, COALESCE(SUM(tax_amount), 0.0) as taxes
+    FROM transactions
+    WHERE business_id = ? AND sender_id = ?
+    """, (business_id, biz["user_id"]))
+    exp_row = cursor.fetchone()
+    expenses = float(exp_row["expenses"])
+    taxes = float(exp_row["taxes"])
+
+    cursor.execute("""
+    SELECT COALESCE(SUM(amount), 0.0) as tax_payments
+    FROM transactions
+    WHERE business_id = ? AND is_tax_payment = 1
+    """, (business_id,))
+    tax_payments = float(cursor.fetchone()["tax_payments"])
+    total_taxes = round(taxes + tax_payments, 2)
+
+    cursor.execute("""
+    SELECT id, sender_name, recipient_name, amount, type, status, description, tax_amount, commission_amount, created_at
+    FROM transactions
+    WHERE business_id = ?
+    ORDER BY created_at DESC, id DESC
+    LIMIT 30
+    """, (business_id,))
+    txs = [dict(r) for r in cursor.fetchall()]
     conn.close()
-    return affected > 0
+
+    return {
+        "business_id": business_id,
+        "company_name": biz["company_name"],
+        "business_type": biz["business_type"],
+        "balance": float(biz["balance"]),
+        "tax_rate": float(biz["tax_rate"]),
+        "total_income": round(income, 2),
+        "total_expenses": round(expenses, 2),
+        "total_taxes_paid": total_taxes,
+        "transactions": txs,
+    }
+
+def pay_business_tax(user_id: int, business_id: int, amount: float, description: Optional[str] = None) -> Dict[str, Any]:
+    if amount <= 0:
+        raise ValueError("Сумма налога должна быть больше 0.")
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("SELECT * FROM business_accounts WHERE id = ? AND user_id = ?", (business_id, user_id))
+        biz = cursor.fetchone()
+        if not biz:
+            raise ValueError("Бизнес-аккаунт не найден.")
+        if biz["balance"] < amount:
+            raise ValueError(f"Недостаточно средств на бизнес-счёте для уплаты налога. Доступно: {biz['balance']:.2f} ₽")
+
+        cursor.execute("UPDATE business_accounts SET balance = balance - ? WHERE id = ?", (amount, business_id))
+        desc = description or f"Уплата налогов/сборов: {biz['company_name']}"
+        cursor.execute("""
+        INSERT INTO transactions (sender_id, recipient_id, sender_name, recipient_name, amount, type, status, description, is_tax_payment, business_id)
+        VALUES (?, NULL, ?, 'Федеральная налоговая служба (ФНС)', ?, 'tax_payment', 'completed', ?, 1, ?)
+        """, (user_id, f"{biz['business_type']} «{biz['company_name']}»", amount, desc, business_id))
+        tx_id = cursor.lastrowid
+        conn.commit()
+        return {"success": True, "transaction_id": tx_id, "amount": amount, "new_balance": round(biz["balance"] - amount, 2)}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def apply_business_credit(
+    user_id: int,
+    business_id: int,
+    title: str,
+    amount: float,
+    interest_rate: float = 12.5,
+    term_months: int = 12,
+) -> Dict[str, Any]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM business_accounts WHERE id = ? AND user_id = ?", (business_id, user_id))
+    biz = cursor.fetchone()
+    conn.close()
+    if not biz:
+        raise ValueError("Бизнес-счёт не найден.")
+    if biz["status"] != "approved":
+        raise ValueError("Кредитование доступно только для подтвержденных организаций.")
+
+    full_title = f"{title.strip() or 'Кредит на развитие бизнеса'} ({biz['company_name']})"
+    return apply_credit(
+        user_id=user_id,
+        title=full_title,
+        amount=amount,
+        interest_rate=interest_rate,
+        term_months=term_months,
+        business_id=business_id,
+    )
 
 def admin_create_deposit(user_id: int, title: str, amount: float, interest_rate: float = 16.0, term_months: int = 6) -> Dict[str, Any]:
     conn = get_connection()

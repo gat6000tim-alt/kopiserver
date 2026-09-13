@@ -21,6 +21,13 @@ from db import (
     transfer_funds,
     find_user_by_target,
     get_user_transactions,
+    clear_user_history,
+    admin_get_user_full_transactions,
+    get_user_credit_history,
+    admin_adjust_user_credit_score,
+    get_business_analytics,
+    pay_business_tax,
+    apply_business_credit,
     update_user_avatar,
     create_nfc_token,
     get_nfc_token,
@@ -52,7 +59,9 @@ from db import (
     admin_delete_credit,
     admin_create_credit,
     issue_pending_credit,
+    repay_user_credit,
     apply_deposit,
+    close_user_deposit,
     get_user_deposits,
     admin_get_all_deposits,
     admin_update_deposit,
@@ -109,6 +118,40 @@ class UserResponse(BaseModel):
     created_at: str
     is_pin_enabled: int = 0
     has_pin: int = 0
+    credit_score: Optional[int] = 650
+    history_cleared_at: Optional[str] = None
+
+class CloseDepositRequest(BaseModel):
+    user_id: int
+    deposit_id: int
+
+class RepayCreditRequest(BaseModel):
+    user_id: int
+    credit_id: int
+    amount: Optional[float] = None
+
+class ClearHistoryRequest(BaseModel):
+    user_id: int
+
+class AdjustCreditScoreRequest(BaseModel):
+    admin_id: Optional[int] = None
+    admin_email: Optional[str] = None
+    user_id: int
+    score_delta: int
+    description: Optional[str] = "Корректировка администратора"
+
+class PayBusinessTaxRequest(BaseModel):
+    user_id: int
+    amount: float
+    description: Optional[str] = None
+
+class ApplyBusinessCreditRequest(BaseModel):
+    user_id: int
+    business_id: int
+    title: Optional[str] = None
+    amount: float
+    interest_rate: Optional[float] = 12.5
+    term_months: Optional[int] = 12
 
 class AvatarUploadRequest(BaseModel):
     avatar_url: str
@@ -918,7 +961,7 @@ def apply_credit_api(req: CreditApplyRequest):
         )
         return {
             "success": True,
-            "message": f"Кредит на сумму {req.amount:.0f} ₽ успешно выдан и зачислен на счет.",
+            "message": f"Заявка на кредит на сумму {req.amount:.0f} ₽ успешно подана и ожидает одобрения администратором.",
             "credit": credit,
         }
     except ValueError as e:
@@ -979,7 +1022,7 @@ def admin_credit_action_api(req: AdminCreditActionRequest):
         return {"success": True, "message": "Параметры кредита успешно обновлены."}
     elif act == "delete":
         admin_delete_credit(req.credit_id)
-        return {"success": True, "message": "Кредит удалён."}
+        return {"success": True, "message": "Кредит удалён, задолженность списана со счёта."}
     else:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Неизвестное действие: {req.action}")
 
@@ -1000,7 +1043,7 @@ def apply_deposit_api(req: DepositApplyRequest):
         )
         return {
             "success": True,
-            "message": f"Вклад на сумму {req.amount:.0f} ₽ успешно открыт. Средства списаны с основного счета.",
+            "message": f"Заявка на открытие вклада на сумму {req.amount:.0f} ₽ отправлена на одобрение администратору.",
             "deposit": deposit,
         }
     except ValueError as e:
@@ -1038,7 +1081,7 @@ def admin_deposit_action_api(req: AdminDepositActionRequest):
         deposit = fund_pending_deposit(req.deposit_id)
         return {
             "success": True,
-            "message": "Вклад открыт, основная сумма списана.",
+            "message": "Вклад открыт, основная сумма списана со счёта клиента.",
             "deposit": deposit,
         }
     elif act == "reject":
@@ -1061,10 +1104,99 @@ def admin_deposit_action_api(req: AdminDepositActionRequest):
         return {"success": True, "message": "Параметры вклада обновлены."}
     elif act == "delete":
         admin_delete_deposit(req.deposit_id)
-        return {"success": True, "message": "Вклад удалён."}
+        return {"success": True, "message": "Вклад удалён, средства возвращены на баланс клиента."}
     else:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Неизвестное действие: {req.action}")
 
+
+@app.post("/api/deposits/close")
+def close_deposit_api(req: CloseDepositRequest):
+    try:
+        res = close_user_deposit(req.user_id, req.deposit_id)
+        return {"success": True, "message": "Вклад успешно закрыт, средства и доход зачислены на ваш баланс.", "deposit": res}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+@app.post("/api/credits/repay")
+def repay_credit_api(req: RepayCreditRequest):
+    try:
+        res = repay_user_credit(req.user_id, req.credit_id, req.amount)
+        return {"success": True, "message": "Платёж по кредиту успешно проведён.", "credit": res}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+@app.post("/api/transactions/clear-history")
+def clear_history_api(req: ClearHistoryRequest):
+    cleared = clear_user_history(req.user_id)
+    return {"success": True, "message": "История операций успешно очищена.", "cleared": cleared}
+
+@app.get("/api/admin/user-audit/{user_id}")
+def admin_user_audit_api(user_id: int, admin_id: Optional[int] = Query(None), admin_email: Optional[str] = Query(None)):
+    verify_is_admin(admin_id, admin_email)
+    user = get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Пользователь не найден.")
+    txs = admin_get_user_full_transactions(user_id)
+    credit_history = get_user_credit_history(user_id)
+    return {
+        "success": True,
+        "user": user,
+        "transactions": txs,
+        "credit_history": credit_history
+    }
+
+@app.get("/api/credit-history/{user_id}")
+def get_credit_history_api(user_id: int):
+    try:
+        res = get_user_credit_history(user_id)
+        return {"success": True, **res}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+@app.post("/api/admin/credit-score/adjust")
+def admin_adjust_credit_score_api(req: AdjustCreditScoreRequest):
+    verify_is_admin(req.admin_id, req.admin_email)
+    try:
+        res = admin_adjust_user_credit_score(
+            admin_id=req.admin_id or 0,
+            user_id=req.user_id,
+            score_delta=req.score_delta,
+            description=req.description or "Корректировка администратором"
+        )
+        return {"success": True, **res}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+@app.get("/api/business/{business_id}/analytics")
+def get_business_analytics_api(business_id: int, user_id: Optional[int] = Query(None)):
+    try:
+        res = get_business_analytics(business_id)
+        return {"success": True, **res}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+@app.post("/api/business/{business_id}/pay-tax")
+def pay_business_tax_api(business_id: int, req: PayBusinessTaxRequest):
+    try:
+        res = pay_business_tax(req.user_id, business_id, req.amount, req.description)
+        return {"success": True, "message": "Налог успешно уплачен.", **res}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+@app.post("/api/business/credit/apply")
+def apply_business_credit_api(req: ApplyBusinessCreditRequest):
+    try:
+        res = apply_business_credit(
+            user_id=req.user_id,
+            business_id=req.business_id,
+            title=req.title or "Кредит на развитие бизнеса",
+            amount=req.amount,
+            interest_rate=req.interest_rate or 12.5,
+            term_months=req.term_months or 12,
+        )
+        return {"success": True, "message": "Заявка на бизнес-кредит успешно подана и отправлена администратору.", "credit": res}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 @app.post("/api/finance/tick")
 def finance_tick_api(req: FinanceTickRequest):

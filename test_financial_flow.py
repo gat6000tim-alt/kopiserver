@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import unittest
 
@@ -53,11 +53,27 @@ class TestFinancialFlow(unittest.TestCase):
         db.close_user_deposit(user_id, dep2["id"])
         self.assertEqual(db.get_user_by_id(user_id)["balance"], 100000.0)
 
-        # 4. Early repay credit
+        # 4. Early repay credit with interest
         cred2 = db.apply_credit(user_id, "Кредит 2", 20000.0, 10.0, 6)
         db.issue_pending_credit(cred2["id"])
         db.repay_user_credit(user_id, cred2["id"])
-        self.assertEqual(db.get_user_by_id(user_id)["balance"], 100000.0)
+        # Списана сумма кредита с процентами (20587.38 ₽ вместо 20000 ₽)
+        self.assertEqual(db.get_user_by_id(user_id)["balance"], 99412.62)
+
+        # 4.1 Business withdrawal with 2% commission
+        biz = db.apply_business_account(user_id, "ООО Ромашка", "ООО", 13.0)
+        db.admin_update_business_status(biz["id"], "approved")
+        # Top up business
+        conn = db.get_connection()
+        conn.cursor().execute("UPDATE business_accounts SET balance = 50000 WHERE id = ?", (biz["id"],))
+        conn.commit()
+        conn.close()
+        withdraw_res = db.withdraw_business_to_personal(user_id, biz["id"], 10000.0, 2.0)
+        self.assertEqual(withdraw_res["commission_amount"], 200.0)
+        self.assertEqual(withdraw_res["net_amount"], 9800.0)
+        self.assertEqual(withdraw_res["new_business_balance"], 40000.0)
+        # 99412.62 - 4000 (госпошлина ООО) + 9800 (вывод дохода) = 105212.62
+        self.assertEqual(db.get_user_by_id(user_id)["balance"], round(99412.62 - 4000.0 + 9800.0, 2))
 
         # 5. Commissions
         recip = db.create_user(f"recip_{os.urandom(4).hex()}@kopi.ru", "testpassword123", "Получатель")

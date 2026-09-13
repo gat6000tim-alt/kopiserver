@@ -27,6 +27,7 @@ from db import (
     admin_adjust_user_credit_score,
     get_business_analytics,
     pay_business_tax,
+    withdraw_business_to_personal,
     apply_business_credit,
     update_user_avatar,
     create_nfc_token,
@@ -144,6 +145,12 @@ class PayBusinessTaxRequest(BaseModel):
     user_id: int
     amount: float
     description: Optional[str] = None
+
+class BusinessWithdrawRequest(BaseModel):
+    user_id: int
+    business_id: int
+    amount: float
+    commission_rate: Optional[float] = 2.0
 
 class ApplyBusinessCreditRequest(BaseModel):
     user_id: int
@@ -1182,6 +1189,25 @@ def pay_business_tax_api(business_id: int, req: PayBusinessTaxRequest):
         return {"success": True, "message": "Налог успешно уплачен.", **res}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+@app.post("/api/business/withdraw")
+def withdraw_business_api(req: BusinessWithdrawRequest):
+    try:
+        res = withdraw_business_to_personal(
+            user_id=req.user_id,
+            business_id=req.business_id,
+            amount=req.amount,
+            commission_rate=req.commission_rate or 2.0,
+        )
+        return {
+            "success": True,
+            "message": f"Средства в размере {req.amount:.2f} ₽ (за вычетом комиссии {res['commission_amount']:.2f} ₽) успешно выведены на личную карту.",
+            "data": res,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Ошибка вывода: {str(e)}")
 
 @app.post("/api/business/credit/apply")
 def apply_business_credit_api(req: ApplyBusinessCreditRequest):

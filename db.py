@@ -545,6 +545,17 @@ def transfer_funds(
     if sender["is_frozen"]:
         conn.close()
         raise ValueError("Ваш счёт заморожен банком. Расходные операции приостановлены.")
+
+    if sender["balance"] < 0:
+        conn.close()
+        raise ValueError(f"Перевод заблокирован: на вашем счете отрицательный баланс ({sender['balance']:.2f} ₽). Пополните счёт для разблокировки.")
+
+    cursor.execute("SELECT COUNT(*), SUM(remaining_amount) FROM credits WHERE user_id = ? AND overdue_since IS NOT NULL", (sender_id,))
+    overdue_row = cursor.fetchone()
+    if overdue_row and overdue_row[0] and overdue_row[0] > 0:
+        overdue_amt = float(overdue_row[1]) if overdue_row[1] else 0.0
+        conn.close()
+        raise ValueError(f"Перевод заблокирован: у вас имеется просроченная задолженность по кредиту на сумму {overdue_amt:.2f} ₽. Погасите задолженность перед банком.")
         
     commission_rate = 0.0
     if tx_type == "qr":
@@ -1357,12 +1368,16 @@ def apply_credit(
     normalized_type = "differentiated" if payment_type.lower() == "differentiated" else "annuity"
     if normalized_type == "differentiated":
         monthly = round((amount / term_months) + (amount * r), 2)
+        total_interest = sum((amount - (k * amount / term_months)) * r for k in range(term_months))
+        total_to_repay = round(amount + total_interest, 2)
     else:
         if r > 0:
             factor = (1 + r) ** term_months
             monthly = round(amount * (r * factor) / (factor - 1), 2)
+            total_to_repay = round(monthly * term_months, 2)
         else:
             monthly = round(amount / term_months, 2)
+            total_to_repay = round(amount, 2)
     
     conn = get_connection()
     try:
@@ -1377,11 +1392,40 @@ def apply_credit(
         score = user["credit_score"] if user["credit_score"] is not None else 650
         if score < 500:
             raise ValueError(f"Кредитование заблокировано: у вас плохая кредитная история (рейтинг: {score} из 850). Для разблокировки погасите задолженности.")
+
+        # Строгие лимиты по скорингу (предотвращение взятия миллиардов и мультиаккаунтов)
+        if business_id:
+            max_allowed = 5000000.0
+        elif score < 600:
+            max_allowed = 150000.0
+        elif score < 700:
+            max_allowed = 500000.0
+        elif score < 750:
+            max_allowed = 1500000.0
+        elif score < 800:
+            max_allowed = 2000000.0
+        else:
+            max_allowed = 3000000.0
+
+        if amount > max_allowed:
+            raise ValueError(f"Запрошенная сумма ({amount:,.0f} ₽) превышает кредитный лимит для вашего рейтинга ({score} баллов). Максимально доступно: {max_allowed:,.0f} ₽.")
+
+        # Проверка просроченной задолженности
+        cursor.execute("SELECT COUNT(*), SUM(remaining_amount) FROM credits WHERE user_id = ? AND overdue_since IS NOT NULL", (user_id,))
+        od = cursor.fetchone()
+        if od and od[0] and od[0] > 0:
+            raise ValueError(f"Кредитование отклонено: у вас имеется непогашенная просроченная задолженность ({od[1]:.2f} ₽).")
+
+        # Проверка суммарной кредитной нагрузки (DTI)
+        cursor.execute("SELECT SUM(remaining_amount) FROM credits WHERE user_id = ? AND status IN ('active', 'pending')", (user_id,))
+        current_debt = cursor.fetchone()[0] or 0.0
+        if current_debt + total_to_repay > max_allowed * 1.3:
+            raise ValueError(f"Превышен совокупный лимит кредитной нагрузки ({max_allowed:,.0f} ₽). Ваши текущие обязательства: {current_debt:,.2f} ₽.")
             
         cursor.execute("""
         INSERT INTO credits (user_id, title, amount, remaining_amount, monthly_payment, interest_rate, term_months, status, payment_type, business_id)
         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-        """, (user_id, title.strip() or ("Кредит для бизнеса" if business_id else "Кредит наличными"), amount, amount, monthly, interest_rate, term_months, normalized_type, business_id))
+        """, (user_id, title.strip() or ("Кредит для бизнеса" if business_id else "Кредит наличными"), amount, total_to_repay, monthly, interest_rate, term_months, normalized_type, business_id))
         c_id = cursor.lastrowid
         
         cursor.execute("""
@@ -1468,15 +1512,28 @@ def admin_delete_credit(credit_id: int) -> bool:
             user = cursor.fetchone()
             user_name = user["full_name"] if user else "Клиент"
             
+            disbursed = float(credit["amount"])
+            amt_to_deduct = min(disbursed, remaining)
+
             if biz_id:
-                cursor.execute("UPDATE business_accounts SET balance = balance - ? WHERE id = ?", (remaining, biz_id))
+                cursor.execute("UPDATE business_accounts SET balance = balance - ? WHERE id = ?", (amt_to_deduct, biz_id))
             else:
-                cursor.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (remaining, user_id))
+                cursor.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (amt_to_deduct, user_id))
+                cursor.execute("SELECT balance FROM users WHERE id = ?", (user_id,))
+                post_user = cursor.fetchone()
+                if post_user and post_user["balance"] < 0:
+                    cursor.execute("UPDATE users SET is_frozen = 1 WHERE id = ?", (user_id,))
+                    adjust_user_credit_score_internal(
+                        cursor,
+                        user_id,
+                        -100,
+                        f"Санкция: аннулирование кредита «{credit['title']}» при отсутствии средств (баланс: {post_user['balance']:.2f} ₽)"
+                    )
 
             cursor.execute("""
             INSERT INTO transactions (sender_id, recipient_id, sender_name, recipient_name, amount, type, status, description, business_id)
             VALUES (?, NULL, ?, 'Копи Банк', ?, 'credit_revoked', 'completed', ?, ?)
-            """, (user_id, user_name, remaining, f"Списание долга при аннулировании кредита: {credit['title']}", biz_id))
+            """, (user_id, user_name, amt_to_deduct, f"Списание долга при аннулировании кредита: {credit['title']}", biz_id))
 
         cursor.execute("DELETE FROM credits WHERE id = ?", (credit_id,))
         affected = cursor.rowcount
@@ -2167,6 +2224,88 @@ def run_finance_tick(user_id: int) -> Dict[str, Any]:
 
         conn.commit()
         return _finance_rows(conn, user_id)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def withdraw_business_to_personal(
+    user_id: int,
+    business_id: int,
+    amount: float,
+    commission_rate: float = 2.0,
+) -> Dict[str, Any]:
+    if amount <= 0:
+        raise ValueError("Сумма вывода должна быть больше 0.")
+    if amount < 100.0:
+        raise ValueError("Минимальная сумма вывода со счёта организации составляет 100 ₽.")
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+
+        cursor.execute("SELECT * FROM business_accounts WHERE id = ? AND user_id = ?", (business_id, user_id))
+        biz = cursor.fetchone()
+        if not biz:
+            raise ValueError("Бизнес-счёт не найден или не принадлежит вам.")
+
+        if biz["status"] != "approved":
+            raise ValueError(f"Вывод невозможен: счёт организации находится в статусе «{biz['status']}».")
+
+        if biz["balance"] < amount:
+            raise ValueError(f"Недостаточно средств на счёте организации. Доступно: {biz['balance']:.2f} ₽, запрошено: {amount:.2f} ₽")
+
+        cursor.execute("SELECT id, full_name, balance, is_frozen FROM users WHERE id = ?", (user_id,))
+        user = cursor.fetchone()
+        if not user:
+            raise ValueError("Пользователь не найден.")
+        if user["is_frozen"]:
+            raise ValueError("Ваш личный счёт заморожен банком. Вывод средств невозможен.")
+
+        commission_amount = round(amount * (commission_rate / 100.0), 2)
+        net_amount = round(amount - commission_amount, 2)
+        if net_amount <= 0:
+            raise ValueError("Сумма перевода слишком мала для покрытия банковской комиссии.")
+
+        new_biz_balance = round(biz["balance"] - amount, 2)
+        new_user_balance = round(user["balance"] + net_amount, 2)
+
+        cursor.execute("UPDATE business_accounts SET balance = ? WHERE id = ?", (new_biz_balance, business_id))
+        cursor.execute("UPDATE users SET balance = ? WHERE id = ?", (new_user_balance, user_id))
+
+        biz_name = f"{biz['business_type']} «{biz['company_name']}»"
+        user_name = user["full_name"]
+
+        # Запись в историю операций по счёту бизнеса
+        desc_biz = f"Вывод средств на личную карту (Комиссия {commission_rate:.1f}%: {commission_amount:.2f} ₽)"
+        cursor.execute("""
+        INSERT INTO transactions (sender_id, recipient_id, sender_name, recipient_name, amount, commission_amount, type, status, description, business_id)
+        VALUES (?, ?, ?, ?, ?, ?, 'business_withdrawal', 'completed', ?, ?)
+        """, (user_id, user_id, biz_name, user_name, amount, commission_amount, desc_biz, business_id))
+        biz_tx_id = cursor.lastrowid
+
+        # Запись в историю операций физлица
+        desc_user = f"Поступление со счёта организации {biz_name} (за вычетом комиссии {commission_rate:.1f}%)"
+        cursor.execute("""
+        INSERT INTO transactions (sender_id, recipient_id, sender_name, recipient_name, amount, commission_amount, type, status, description)
+        VALUES (?, ?, ?, ?, ?, 0, 'transfer', 'completed', ?)
+        """, (user_id, user_id, biz_name, user_name, net_amount, desc_user))
+
+        conn.commit()
+        return {
+            "success": True,
+            "business_id": business_id,
+            "amount_withdrawn": amount,
+            "commission_rate": commission_rate,
+            "commission_amount": commission_amount,
+            "net_amount": net_amount,
+            "new_business_balance": new_biz_balance,
+            "new_user_balance": new_user_balance,
+            "transaction_id": biz_tx_id,
+        }
     except Exception:
         conn.rollback()
         raise

@@ -9,7 +9,24 @@ import db
 class TestFinancialFlow(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.orig_db_path = db.DB_PATH
+        cls.test_db_path = os.path.join(os.path.dirname(__file__), "test_financial_scratch.db")
+        if os.path.exists(cls.test_db_path):
+            try:
+                os.remove(cls.test_db_path)
+            except Exception:
+                pass
+        db.DB_PATH = cls.test_db_path
         db.init_db()
+
+    @classmethod
+    def tearDownClass(cls):
+        db.DB_PATH = cls.orig_db_path
+        if os.path.exists(cls.test_db_path):
+            try:
+                os.remove(cls.test_db_path)
+            except Exception:
+                pass
 
     def test_full_financial_lifecycle(self):
         test_email = f"tester_{os.urandom(4).hex()}@kopi.ru"

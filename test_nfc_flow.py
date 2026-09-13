@@ -1,20 +1,36 @@
+import os
 import unittest
 from fastapi.testclient import TestClient
 from main import app
-from db import init_db, get_all_users, get_user_by_id, admin_credit_user
+import db
 
 class TestNfcPaymentFlow(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        init_db()
+        cls.orig_db_path = db.DB_PATH
+        cls.test_db_path = os.path.join(os.path.dirname(__file__), "test_nfc_scratch.db")
+        if os.path.exists(cls.test_db_path):
+            try:
+                os.remove(cls.test_db_path)
+            except Exception:
+                pass
+        db.DB_PATH = cls.test_db_path
+        db.init_db()
         cls.client = TestClient(app)
-        users = get_all_users()
-        if len(users) < 2:
-            raise RuntimeError("Need at least 2 users in db for tests")
-        cls.payer = users[0]
-        cls.merchant = users[1]
-        
-        admin_credit_user(cls.payer["id"], 5000.0, "Центробанк")
+        payer = db.create_user("temp_payer@kopi.ru", "password123", "Тест Плательщик")
+        merchant = db.create_user("temp_merchant@kopi.ru", "password123", "Тест Продавец")
+        cls.payer = payer
+        cls.merchant = merchant
+        db.admin_credit_user(cls.payer["id"], 5000.0, "Центробанк")
+
+    @classmethod
+    def tearDownClass(cls):
+        db.DB_PATH = cls.orig_db_path
+        if os.path.exists(cls.test_db_path):
+            try:
+                os.remove(cls.test_db_path)
+            except Exception:
+                pass
 
     def test_full_nfc_flow_and_security(self):
         payer_id = self.payer["id"]

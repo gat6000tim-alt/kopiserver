@@ -1393,7 +1393,7 @@ def apply_credit(
         if score < 500:
             raise ValueError(f"Кредитование заблокировано: у вас плохая кредитная история (рейтинг: {score} из 850). Для разблокировки погасите задолженности.")
 
-        # Строгие лимиты по скорингу (предотвращение взятия миллиардов и мультиаккаунтов)
+                                                                                         
         if business_id:
             max_allowed = 5000000.0
         elif score < 600:
@@ -1410,13 +1410,13 @@ def apply_credit(
         if amount > max_allowed:
             raise ValueError(f"Запрошенная сумма ({amount:,.0f} ₽) превышает кредитный лимит для вашего рейтинга ({score} баллов). Максимально доступно: {max_allowed:,.0f} ₽.")
 
-        # Проверка просроченной задолженности
+                                             
         cursor.execute("SELECT COUNT(*), SUM(remaining_amount) FROM credits WHERE user_id = ? AND overdue_since IS NOT NULL", (user_id,))
         od = cursor.fetchone()
         if od and od[0] and od[0] > 0:
             raise ValueError(f"Кредитование отклонено: у вас имеется непогашенная просроченная задолженность ({od[1]:.2f} ₽).")
 
-        # Проверка суммарной кредитной нагрузки (DTI)
+                                                     
         cursor.execute("SELECT SUM(remaining_amount) FROM credits WHERE user_id = ? AND status IN ('active', 'pending')", (user_id,))
         current_debt = cursor.fetchone()[0] or 0.0
         if current_debt + total_to_repay > max_allowed * 1.3:
@@ -2167,7 +2167,7 @@ def run_finance_tick(user_id: int) -> Dict[str, Any]:
                     else:
                         current_payment = float(credit["monthly_payment"])
 
-                    # Guardrail: balance can never go below 0.0
+                                                               
                     available_balance = max(0.0, balance)
                     payable = min(current_payment, remaining, available_balance)
 
@@ -2198,7 +2198,7 @@ def run_finance_tick(user_id: int) -> Dict[str, Any]:
                             ),
                         )
 
-                    # Overdraft guardrail: if payment could not be completed, flag overdue without debiting into negative
+                                                                                                                         
                     if remaining > 0.01 and payable + 0.01 < current_payment:
                         unpaid_amount = current_payment - payable
                         penalty = round(unpaid_amount * monthly_rate, 2)
@@ -2279,7 +2279,7 @@ def withdraw_business_to_personal(
         biz_name = f"{biz['business_type']} «{biz['company_name']}»"
         user_name = user["full_name"]
 
-        # Запись в историю операций по счёту бизнеса
+                                                    
         desc_biz = f"Вывод средств на личную карту (Комиссия {commission_rate:.1f}%: {commission_amount:.2f} ₽)"
         cursor.execute("""
         INSERT INTO transactions (sender_id, recipient_id, sender_name, recipient_name, amount, commission_amount, type, status, description, business_id)
@@ -2287,7 +2287,7 @@ def withdraw_business_to_personal(
         """, (user_id, user_id, biz_name, user_name, amount, commission_amount, desc_biz, business_id))
         biz_tx_id = cursor.lastrowid
 
-        # Запись в историю операций физлица
+                                           
         desc_user = f"Поступление со счёта организации {biz_name} (за вычетом комиссии {commission_rate:.1f}%)"
         cursor.execute("""
         INSERT INTO transactions (sender_id, recipient_id, sender_name, recipient_name, amount, commission_amount, type, status, description)
